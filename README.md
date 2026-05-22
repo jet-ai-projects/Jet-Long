@@ -9,7 +9,7 @@
 
 ## 1. 💡 Introduction
 
-https://github.com/user-attachments/assets/e46d88f0-52d5-4388-9d36-3660c4b6fbfe
+https://github.com/user-attachments/assets/52d59246-f648-4fda-91b5-aa007cc2c30a
 
 ### News
 
