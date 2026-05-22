@@ -1,0 +1,22 @@
+name: pg19_ppl
+type: pg19_ppl
+mode: anchored_growing
+dataset: emozilla/pg19
+# split:
+#   subsample   → processed_data/PG-19-subsample/books.jsonl (100 books, all >=131k tokens)
+#   auto        → subsample if available, else test
+#   test/train  → HF emozilla/pg19
+split: subsample
+num_books: 100
+# stride = step size of the anchored growing window. The curve has l_max/stride points.
+# 1024 gives 128 points (32k=k=32, 64k=k=64, 96k=k=96, 128k=k=128).
+# Override via --stride or STRIDE env in the launchers.
+stride: 1024
+l_max: 131072
+# batch_size = books per forward pass on each rank (data-parallel within rank).
+# For B200 (192 GB HBM3e): 4 fits at 8B + l_max=131072 with ~62 GB peak.
+# For H100 (80 GB): use 1 (or 2 for 1.7B). Override via --batch_size or BATCH_SIZE env.
+batch_size: 4
+# CSV target columns + the named checkpoints copied to wandb.summary (`ppl_at_<L>`).
+target_lengths_for_csv: [32768, 65536, 98304, 131072]
+wandb_checkpoint_lengths: [32768, 65536, 98304, 131072]

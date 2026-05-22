@@ -1,0 +1,38 @@
+name: ruler
+type: ruler
+data_dir: processed_data/RULER-data
+lengths: [4096, 8192, 16384, 32768, 65536, 131072]
+verbose: true
+tasks:
+  - name: niah_single_1
+    subset: validation
+  - name: niah_single_2
+    subset: validation
+  - name: niah_single_3
+    subset: validation
+  - name: niah_multikey_1
+    subset: validation
+  - name: niah_multikey_2
+    subset: validation
+  - name: niah_multikey_3
+    subset: validation
+  - name: niah_multivalue
+    subset: validation
+  - name: niah_multiquery
+    subset: validation
+  - name: vt
+    subset: validation
+  - name: cwe
+    subset: validation
+  - name: fwe
+    subset: validation
+  - name: qa_1
+    subset: validation
+  - name: qa_2
+    subset: validation
+generation_config:
+  do_sample: false
+  temperature: 0
+  top_k: 32
+  top_p: 1.0
+  stop: ""

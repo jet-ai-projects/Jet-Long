@@ -1,0 +1,639 @@
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# JetLong for Qwen3 (fused kernel) — Bifocal Dynamic Self-Extend
+#
+# Same length extrapolation as the `jetlong` method: the distant branch uses
+# Self-Extend integer-floor position grouping p -> floor(p / G), G = ceil(L_curr / w),
+# which caps every evaluated phase at <= w (the pretrained window) and removes OOD
+# phase drift on the high-frequency channels; the local window keeps exact base RoPE.
+#
+# This variant computes the local and distant attention with a fused
+# FlashAttention-4 / CuTe SM90 kernel (jetlm/kernels) rather than a multi-call
+# FlashAttention merge:
+#   prefill — one block-sparse call over the local (base RoPE) and distant (grouped
+#             RoPE) regions, merged once in fp32.
+#   decode  — one streaming-softmax kernel over the nearby and distant regions.
+# Requires the flash_attn.cute runtime; inference-only.
+
+import math
+from collections.abc import Callable
+from typing import Optional
+
+import torch
+from torch import nn
+
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
+
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3DecoderLayer,
+    Qwen3MLP,
+    Qwen3PreTrainedModel,
+    Qwen3RMSNorm,
+    eager_attention_forward,
+)
+
+
+# ---------------------------------------------------------------------------
+# Rotary Embedding (JetLong — Dynamic Self-Extend)
+# ---------------------------------------------------------------------------
+
+class Qwen3JetLongFusedRotaryEmbedding(nn.Module):
+    """
+    Dynamic-SE rotary: returns base (cos, sin) plus, when L_curr > w, the
+    dynamic group size G and base inv_freq so attention can compute grouped
+    queries/keys on-the-fly via correction_rotate.
+
+    Returns:
+        If jetlong disabled or L_curr <= w: (base_cos, base_sin) — 2-tuple
+        If jetlong enabled and L_curr > w:   (base_cos, base_sin, G, inv_freq) — 4-tuple
+    """
+    inv_freq: torch.Tensor
+
+    def __init__(self, config: Qwen3Config, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.config = config
+
+        # --- Base inv_freq (identical to vanilla Qwen3RotaryEmbedding) ---
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+        # --- JetLong configuration ---
+        jetlong_cfg = getattr(config, "jetlong", None)
+        if jetlong_cfg is None:
+            jetlong_cfg = config.to_dict().get("jetlong", None) if hasattr(config, "to_dict") else None
+
+        self.jetlong_enabled = jetlong_cfg is not None
+
+        if self.jetlong_enabled:
+            self._jetlong_cfg = jetlong_cfg
+            self.jetlong_w = jetlong_cfg["w"]
+            self.jetlong_w_0 = jetlong_cfg["w_0"]
+            self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: Qwen3Config | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        base = config.rope_parameters["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        attention_factor = 1.0
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(self, x, position_ids):
+        device = x.device
+        dtype = x.dtype
+
+        def _compute_base_cos_sin():
+            inv_exp = self.inv_freq[None, :, None].float().expand(
+                position_ids.shape[0], -1, 1
+            ).to(device)
+            pos_exp = position_ids[:, None, :].float().to(device)
+
+            device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+            with maybe_autocast(device_type=device_type, enabled=False):
+                freqs = (inv_exp.float() @ pos_exp.float()).transpose(1, 2)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos() * self.attention_scaling
+                sin = emb.sin() * self.attention_scaling
+            return cos.to(dtype), sin.to(dtype)
+
+        base_cos, base_sin = _compute_base_cos_sin()
+
+        if not self.jetlong_enabled:
+            return base_cos, base_sin
+
+        max_pos = position_ids.max().item()
+        L_curr = max_pos + 1
+
+        if L_curr <= self.jetlong_w:
+            # Within pretrained range: pure base, no grouping
+            return base_cos, base_sin
+
+        # --- Dynamic Self-Extend group size ---
+        # G = ceil(L_curr / w) keeps every grouped position <= w-1 (in-distribution phase).
+        G = max(1, math.ceil(L_curr / self.jetlong_w))
+
+        # Pass position_ids through so attention can compute per-sample grouping
+        # deltas — required for correctness with left-padded batches.
+        return base_cos, base_sin, G, self.inv_freq.to(device), position_ids
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_q_only(q, cos, sin, unsqueeze_dim=1):
+    """Apply rotary embedding to query states only."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    return q_embed
+
+
+def correction_rotate(x, positions, delta_inv_freq, dtype, seq_dim=2):
+    """Apply correction rotation with batch-shared positions (seq_len,).
+
+    Args:
+        x: tensor with seq_len at dimension seq_dim
+        positions: (seq_len,) integer or float positions
+        delta_inv_freq: (dim/2,) delta frequency vector
+        dtype: output dtype
+        seq_dim: which dimension of x holds the sequence length
+    """
+    angles = torch.outer(positions.float(), delta_inv_freq.float())  # (S, D/2)
+    emb = torch.cat((angles, angles), dim=-1)  # (S, D)
+    corr_cos = emb.cos().to(dtype)
+    corr_sin = emb.sin().to(dtype)
+
+    shape = [1] * x.dim()
+    shape[seq_dim] = positions.shape[0]
+    shape[-1] = x.shape[-1]
+
+    return x * corr_cos.view(*shape) + rotate_half(x) * corr_sin.view(*shape)
+
+
+def correction_rotate_per_sample(x, positions_2d, delta_inv_freq, dtype):
+    """Apply correction rotation with per-sample positions (B, S).
+
+    Needed when a batch is left-padded: HF adjusts base RoPE via per-sample
+    position_ids, so the correction must also be per-sample to stay aligned.
+
+    Args:
+        x: (B, H, S, D) base-rotated tensor.
+        positions_2d: (B, S) delta positions per sample.
+        delta_inv_freq: (D/2,) delta frequency vector.
+        dtype: output dtype.
+    """
+    # angles: (B, S, D/2) = positions_2d (B, S, 1) * delta_inv_freq (1, 1, D/2)
+    angles = positions_2d.float().unsqueeze(-1) * delta_inv_freq.float().view(1, 1, -1)
+    emb = torch.cat((angles, angles), dim=-1)  # (B, S, D)
+    corr_cos = emb.cos().to(dtype).unsqueeze(1)  # (B, 1, S, D), broadcasts over heads
+    corr_sin = emb.sin().to(dtype).unsqueeze(1)
+    return x * corr_cos + rotate_half(x) * corr_sin
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand KV heads: (batch, kv_heads, seq, dim) -> (batch, heads, seq, dim)."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+
+# ---------------------------------------------------------------------------
+# Attention (JetLong v1)
+# ---------------------------------------------------------------------------
+
+class Qwen3JetLongFusedAttention(nn.Module):
+    """Multi-headed attention with JetLong v1 (Naive Hard Split)."""
+
+    def __init__(self, config: Qwen3Config, layer_idx: int):
+        super().__init__()
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+
+        # --- JetLong parameters ---
+        jetlong_cfg = config.to_dict().get("jetlong", None) if hasattr(config, "to_dict") else None
+        self.jetlong_enabled = jetlong_cfg is not None
+        if self.jetlong_enabled:
+            self.jetlong_w = jetlong_cfg["w"]
+            self.jetlong_w_0 = jetlong_cfg["w_0"]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, ...],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # --- Project & QK-norm ---
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # --- Dispatch on position_embeddings tuple length ---
+        is_extended = len(position_embeddings) >= 4
+
+        if not is_extended:
+            # ---- PATH 1: Pure base attention (L_curr <= w or jetlong disabled) ----
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            if past_key_values is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, attn_weights = attention_interface(
+                self, query_states, key_states, value_states, attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling, sliding_window=self.sliding_window, **kwargs,
+            )
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
+
+        # ---- Extended paths (JetLong: Bifocal Dynamic Self-Extend) ----
+        base_cos, base_sin, G, inv_freq, position_ids = position_embeddings
+        w_0 = self.jetlong_w_0
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # Apply base RoPE to Q and K
+        query_base, key_base = apply_rotary_pos_emb(
+            query_states, key_states, base_cos, base_sin
+        )
+
+        B = query_base.shape[0]
+
+        # Cache base-rotated keys (invariant: cache always stores base-RoPE'd keys)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": base_sin, "cos": base_cos, "cache_position": cache_position}
+            key_base, value_states = past_key_values.update(
+                key_base, value_states, self.layer_idx, cache_kwargs
+            )
+
+        max_q_pos = cache_position[-1].item() if cache_position is not None else 0
+        seq_len = query_base.shape[2]
+        total_kv_len = key_base.shape[2]
+
+        # O(1) pad detection: position_ids[b, -1] is sample b's last real position.
+        # For fresh prefill: pad_b = (total_kv_len - 1) - last_real_pos = # of left-pads.
+        # For chunked prefill & decode: the same identity holds because each chunk's
+        # last position_ids element is the most recent real position in cache.
+        if position_ids is not None and B > 1:
+            pad_counts_kv = (total_kv_len - 1 - position_ids[:, -1]).clamp(min=0).long()
+            has_any_pad = bool((pad_counts_kv > 0).any().item())
+        else:
+            pad_counts_kv = torch.zeros(B, device=device, dtype=torch.long)
+            has_any_pad = False
+
+        # JetLong-Fused: the extended (L > w) prefill/decode are computed by the
+        # fused CuTe SM90 kernels (jetlm.kernels) — no FlashAttention-2 is used or
+        # imported here, so this method runs in the FA4/CuTe-only environment.
+
+        if seq_len > 1:
+            # ---- PATH 2: Prefill (fused single-call, uniform scale) ----
+
+            # Per-sample positions. In fresh prefill, K positions = Q positions.
+            q_pos_2d = position_ids.float()  # (B, S)
+            if total_kv_len == seq_len:
+                k_pos_2d = q_pos_2d
+            else:
+                # Chunked prefill with past cache: reconstruct K positions from
+                # per-sample left-padding offset.
+                idx_range_kc = torch.arange(total_kv_len, device=device, dtype=torch.float32)
+                k_pos_2d = (idx_range_kc.unsqueeze(0) - pad_counts_kv.float().unsqueeze(-1)).clamp(min=0)
+
+            # Dynamic Self-Extend: target phase = floor(p/G) * theta
+            delta_q_pos_2d = torch.floor(q_pos_2d / G) - q_pos_2d  # (B, S)
+            delta_k_pos_2d = torch.floor(k_pos_2d / G) - k_pos_2d  # (B, total_kv_len)
+
+            q_group = correction_rotate_per_sample(query_base, delta_q_pos_2d, inv_freq, dtype)
+            k_group = correction_rotate_per_sample(key_base,   delta_k_pos_2d, inv_freq, dtype)
+
+            scale = self.scaling
+
+            # Fused prefill: the disjoint local-window (base RoPE) + distant
+            # (grouped RoPE) partition is computed in a single block-sparse FA4
+            # CuTe call and merged via the fused LSE kernel. Inference-only;
+            # left-padded batches are unsupported (raises if has_any_pad).
+            from jetlm.kernels.cute_jetlong_backend import fused_jetlong_prefill
+
+            attn_output = fused_jetlong_prefill(
+                query_base, q_group, key_base, k_group, value_states,
+                seqstart_q=total_kv_len - seq_len,
+                window_size_left=w_0,
+                softmax_scale=scale,
+                has_any_pad=has_any_pad,
+                training=self.training,
+            )
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None
+
+        # ---- PATH 3: Decode (seq_len == 1) ----
+        # Q is (B, 1, H, D) — all real. Only K (past cache) can hold pads, for
+        # samples left-padded during prefill; the fused kernel masks those on the
+        # distant branch, and the nearby region already sits past the pad region.
+
+        max_q_pos_batch = int(position_ids.max().item())
+        boundary = max(max_q_pos_batch - w_0, 0)
+
+        # Grouped query per sample
+        q_pos_2d = position_ids.float()  # (B, 1)
+        delta_q_2d = torch.floor(q_pos_2d / G) - q_pos_2d
+        q_group = correction_rotate_per_sample(query_base, delta_q_2d, inv_freq, dtype)
+
+        # kernel layout: (B, H, S, D) -> (B, S, H, D)
+        q_base_fa  = query_base.transpose(1, 2)
+        q_group_fa = q_group.transpose(1, 2)
+
+        if boundary == 0:
+            # Pure base attention (decode context still within the local window).
+            # The fused decode kernel requires a non-empty distant region, and
+            # this method has no FA2 fallback — so it is long-context-only.
+            raise RuntimeError(
+                f"jetlong_fused requires a non-empty distant decode region "
+                f"(decode context must exceed w_0={w_0}); use the 'jetlong' method "
+                f"for short contexts."
+            )
+        else:
+            k_nearby_base = key_base[:, :, boundary:, :]
+            v_nearby_base = value_states[:, :, boundary:, :]
+            k_distant_base = key_base[:, :, :boundary, :]
+            v_distant_base = value_states[:, :, :boundary, :]
+
+            # Per-sample K positions for correction (pads mapped to real pos 0 but skipped in attention)
+            pad_counts_f = pad_counts_kv.float()
+            idx_range_d = torch.arange(boundary, device=device, dtype=torch.float32)
+            k_pos_distant_2d = (idx_range_d.unsqueeze(0) - pad_counts_f.unsqueeze(-1)).clamp(min=0)
+            delta_k_distant_2d = torch.floor(k_pos_distant_2d / G) - k_pos_distant_2d
+            k_distant_group = correction_rotate_per_sample(
+                k_distant_base, delta_k_distant_2d, inv_freq, dtype
+            )
+
+            k_nearby           = k_nearby_base.transpose(1, 2)
+            v_nearby           = v_nearby_base.transpose(1, 2)
+            k_distant_group_fa = k_distant_group.transpose(1, 2)
+            v_distant          = v_distant_base.transpose(1, 2)
+
+            # Fused decode: near (base RoPE, sliding window) + distant (grouped
+            # RoPE) attention streamed through one online-softmax accumulation in
+            # a single CuTe kernel. Inference-only; left-padded batches unsupported.
+            from jetlm.kernels.cute_jetlong_backend import fused_jetlong_decode
+
+            attn_output = fused_jetlong_decode(
+                q_base_fa, q_group_fa, k_nearby, v_nearby, k_distant_group_fa, v_distant,
+                inv_freq=inv_freq, group_size=G,
+                has_any_pad=has_any_pad, training=self.training,
+            )
+
+        # (B, 1, num_heads, D) -> (B, 1, hidden_size)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
+
+# ---------------------------------------------------------------------------
+# Decoder layer — swap in JetLong v1 attention
+# ---------------------------------------------------------------------------
+
+class Qwen3JetLongFusedDecoderLayer(Qwen3DecoderLayer):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.self_attn = Qwen3JetLongFusedAttention(config=config, layer_idx=layer_idx)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class Qwen3JetLongFusedModel(Qwen3PreTrainedModel):
+    def __init__(self, config: Qwen3Config):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [Qwen3JetLongFusedDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3JetLongFusedRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        self.post_init()
+
+    @merge_with_config_defaults
+    @capture_outputs
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Causal LM head
+# ---------------------------------------------------------------------------
+
+class Qwen3JetLongFusedForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen3JetLongFusedModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    @can_return_tuple
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+__all__ = ["Qwen3JetLongFusedForCausalLM", "Qwen3JetLongFusedModel", "Qwen3JetLongFusedRotaryEmbedding"]

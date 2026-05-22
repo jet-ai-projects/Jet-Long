@@ -1,0 +1,14 @@
+torch==2.9.1
+transformers==5.3.0
+flash-attn==2.8.3
+accelerate
+datasets==4.6.1
+wandb
+nvidia-ml-py
+portalocker
+pyyaml
+jieba
+fuzzywuzzy
+rouge
+python-Levenshtein
+lm_eval[ruler]@git+https://github.com/jetlm-ai/lm-evaluation-harness.git@jetai

@@ -1,0 +1,60 @@
+# python
+__pycache__
+.pytest_cache
+.ipynb_checkpoints/
+*.swp
+.pylintrc
+
+# vscode
+*.DS_Store
+.vscode
+
+# exp dir
+.test/
+.slurm/
+slurm-logs/
+slurm-*.out
+slurm-*.err
+
+# dataset
+assets/dataset/
+.cache
+processed_data
+
+# model
+checkpoints/
+*.safetensors
+jetlm/modeling/hf/config.json
+jetlm/modeling/hf/model.safetensors.index.json
+/model_cache
+/model_cache_old
+
+# logs
+results
+output
+
+# build
+*.egg-info/
+flash-attention/
+build_fa2.sh
+.torch_extensions/
+
+# train
+/ckpt/
+/logs/
+/wandb/
+
+# exp
+/*exp*.py
+/tmp
+
+# data
+processed_data
+
+# debug
+*.ipynb
+/list_repo.py
+.claude
+
+# experiment
+/scripts/eval/ruler/_sweep_1d7B_test.sh

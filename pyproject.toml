@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jet-long"
+version = "1.0"
+readme = "README.md"
+description = "Training-free length extrapolation methods for Qwen3 base models, evaluated on RULER / HELMET / PG-19."
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.9.1", "accelerate", "transformers==5.3.0", "datasets==4.6.1",
+    "wandb", "nvidia-ml-py", "portalocker", "pyyaml",
+    "jieba", "fuzzywuzzy", "rouge", "python-Levenshtein",
+    "lm_eval[ruler]@git+https://github.com/jetlm-ai/lm-evaluation-harness.git@jetai",
+]
+
+# Optional extras for the fused FlashAttention-4 / CuTe SM90 kernels (jetlm.kernels),
+# used only by the `jetlong_fused` method. SM90/H100 + CUDA 13 only. Install with
+# `pip install -e ".[fused]"`. NOTE: flash_attn_4 (which provides flash_attn.cute) is a
+# beta and must be installed separately — see the fused install section in README.md.
+[project.optional-dependencies]
+fused = [
+    "nvidia-cutlass-dsl==4.5.1", "nvidia-cutlass-dsl-libs-base==4.5.1",
+    "quack-kernels==0.4.1", "cuda-python==13.2.0", "cuda-bindings==13.2.0",
+    "apache-tvm-ffi==0.1.11", "torch-c-dlpack-ext==0.1.5",
+    "einops==0.8.2", "ninja==1.13.0",
+    # NOTE: triton is supplied transitively by torch (2.9.1 → triton 3.5.1); do
+    # not pin it here or it conflicts with torch's pin (the FA4/CuTe kernels do
+    # not import triton directly).
+]
+
+
+[tool.black]
+line-length = 120
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 120
+skip = [".slurm", "assets", "processed_data", "scripts", "slurm-logs"]
+
+[tool.pylint]
+    [tool.pylint.master]
+    [tool.pylint.messages_control]
+    disable = [
+        "C0114",
+        "C0115",
+        "C0116",
+        "C0209",
+        "C0330",
+        "C0301",
+        "C0302",
+        "C0415",
+        "E0401",
+        "E1121",
+        "E1123",
+        "E1101",
+        "R",
+        "W"
+    ]
+    [tool.pylint.basic]
+    good-names-rgxs = "^[_a-z][_a-z0-9]?$"  # allow 1 or 2 character names
+    [tool.pylint.format]
+    max-line-length = 120
+    max-module-lines = 5000
+    [tool.pylint.design]
+    max-args = 10
+    max-attributes = 15
+    max-parents = 10
+
+[tool.setuptools.packages.find]
+include = ["jetlm*"]
+
+[tool.setuptools.package-data]
+"jetlm.kernels" = ["csrc/*.cpp", "csrc/*.cu"]
