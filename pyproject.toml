@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
@@ -11,7 +14,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.1", "accelerate", "transformers==5.3.0", "datasets==4.6.1",
     "wandb", "nvidia-ml-py", "portalocker", "pyyaml",
-    "jieba", "fuzzywuzzy", "rouge", "python-Levenshtein",
+    "jieba", "rouge",
     "lm_eval[ruler]@git+https://github.com/jetlm-ai/lm-evaluation-harness.git@jetai",
 ]
 
