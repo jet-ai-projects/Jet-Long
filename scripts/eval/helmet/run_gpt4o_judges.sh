@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Run HELMET's GPT-4o judges over LongQA + Summ generations, then re-aggregate
 # result.json so the paper-faithful gpt-4-score / gpt-4-f1 metrics replace the
 # rougeL_f1 surrogates.

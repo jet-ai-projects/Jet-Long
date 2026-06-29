@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Single-node bash launcher for RULER with the fused CuTe kernel (jetlong_fused).
 # Run from the FUSED conda env (flash_attn_4 / flash_attn.cute), e.g. `jtl-fused`:
 #     conda activate jtl-fused

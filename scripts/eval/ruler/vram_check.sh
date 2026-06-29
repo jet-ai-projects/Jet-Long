@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Usage: bash scripts/eval/ruler/vram_check.sh <MODEL_NAME> <EVAL_BS>
 # Activate the python env first; this mimics a cluster eval (8 ranks).
 set -e

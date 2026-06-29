@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Launch HELMET evaluation for a jetlm model, sharding tasks across 8 GPUs.
 #
 # Usage:

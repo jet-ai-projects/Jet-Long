@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Single-node bash launcher for RULER. Activate the python env first, then:
 #     bash scripts/eval/ruler/qwen4B_base_jetlong.sh
 
