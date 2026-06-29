@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Pull every eval dataset into its canonical local path under processed_data/
 # by calling scripts/data/download_data.py once per dataset.
 #
