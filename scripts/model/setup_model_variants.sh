@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Setup model variants by:
 #   1. Downloading base models from HuggingFace
 #   2. Materializing each variant under model_cache/<variant>/ as a directory of

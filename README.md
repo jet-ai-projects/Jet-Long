@@ -25,8 +25,9 @@ https://github.com/user-attachments/assets/52d59246-f648-4fda-91b5-aa007cc2c30a
 + [7. Project Structure](#7-project-structure)
 + [8. Acknowledgements](#8-acknowledgements)
 + [9. Contact](#9-contact)
-+ [10. License](#10-license)
-+ [11. BibTeX](#11-bibtex)
++ [10. Contributing](#10-contributing)
++ [11. License](#11-license)
++ [12. BibTeX](#12-bibtex)
 
 ## 2. Installation
 
@@ -57,7 +58,7 @@ conda activate jtl
 `pip install -e .` reads [`pyproject.toml`](pyproject.toml) and pulls torch 2.9.1,
 transformers 5.3.0, datasets 4.6.1, accelerate, wandb, nvidia-ml-py, lm_eval
 (jetlm-ai fork pinned to the `jetai` tag), and the RULER/PG-19 metric deps
-(jieba, rouge, python-Levenshtein, etc.):
+(jieba, rouge, etc.):
 
 ```bash
 pip install -e .
@@ -379,10 +380,17 @@ models we extend.
 + [Haozhan Tang](https://haozhantang.com/)
 + [Song Han](https://hanlab.mit.edu/songhan)
 
-## 10. License
+## 10. Contributing
+
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and
+Developer Certificate of Origin (DCO) sign-off requirements.
+
+## 11. License
 
 This codebase is released under the [Apache License 2.0](LICENSE).
+Third-party dependency notices are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## 11. BibTeX
+## 12. BibTeX
 
 This is a place holder, we will add the citation in bibtex after arxiv publish.

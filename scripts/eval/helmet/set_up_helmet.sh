@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # One-shot HELMET setup. Idempotent — re-runs only do work that hasn't been
 # done yet. Activate the python env first, then run.
 #
