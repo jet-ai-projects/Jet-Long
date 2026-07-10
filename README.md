@@ -4,7 +4,7 @@
 
 # Jet-Long: Efficient Long-Context Extension with Dynamic Bifocal RoPE
 <div align="center">
-  <a href="https://arxiv.org/abs/2604.13010"><img src="https://img.shields.io/static/v1?label=arXiv&message=Jet-Long&color=red&logo=arxiv"></a> &ensp;
+  <a href="https://arxiv.org/abs/2607.07740"><img src="https://img.shields.io/static/v1?label=arXiv&message=Jet-Long&color=red&logo=arxiv"></a> &ensp;
 </div>
 
 ## 1. 💡 Introduction
@@ -393,4 +393,16 @@ Third-party dependency notices are listed in
 
 ## 12. BibTeX
 
-This is a place holder, we will add the citation in bibtex after arxiv publish.
+If you find Jet-Long useful, please cite:
+
+```bibtex
+@misc{jetlong2026,
+  title={Jet-Long: Efficient Long-Context Extension with Dynamic Bifocal RoPE},
+  author={Haozhan Tang and Zerui Wang and Yuxian Gu and Song Han and Han Cai},
+  year={2026},
+  eprint={2607.07740},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2607.07740},
+}
+```
