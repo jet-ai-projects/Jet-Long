@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/52d59246-f648-4fda-91b5-aa007cc2c30a
 
 ### News
 
+- \[2026.09.28\] Jet-Long is accepted to NeurIPS 2026, see you at Atlanta!
 - \[2026.05.21\] We released Jet-Long.
 
 ### Contents
