@@ -2,7 +2,7 @@
 
 
 
-# Jet-Long: Efficient Long-Context Extension with Dynamic Bifocal RoPE
+# [NeurIPS 2026] Jet-Long: Efficient Long-Context Extension with Dynamic Bifocal RoPE
 <div align="center">
   <a href="https://arxiv.org/abs/2607.07740"><img src="https://img.shields.io/static/v1?label=arXiv&message=Jet-Long&color=red&logo=arxiv"></a> &ensp;
 </div>
@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/52d59246-f648-4fda-91b5-aa007cc2c30a
 
 ### News
 
+- \[2026.09.28\] Jet-Long was accepted by NeurIPS 2026.
 - \[2026.05.21\] We released Jet-Long.
 
 ### Contents
