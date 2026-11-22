@@ -5,6 +5,7 @@
 # [NeurIPS 2026] Jet-Long: Efficient Long-Context Extension with Dynamic Bifocal RoPE
 <div align="center">
   <a href="https://arxiv.org/abs/2607.07740"><img src="https://img.shields.io/static/v1?label=arXiv&message=Jet-Long&color=red&logo=arxiv"></a> &ensp;
+  <a href="https://huggingface.co/papers/2607.07740"><img src="https://img.shields.io/static/v1?label=Hugging%20Face&message=Paper&color=yellow&logo=huggingface" alt="Hugging Face Paper"></a> &ensp;
 </div>
 
 ## 1. 💡 Introduction
